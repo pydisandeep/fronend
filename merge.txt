@@ -1,0 +1,81 @@
+from typing import List, Dict, Any
+
+from schemas.vqc_state_new import VQCState, RuleApplicationResult
+
+
+def merge_updates_node(state: VQCState) -> VQCState:
+    """
+    Merge rule results back into the document elements, including paragraphs
+    inside table cells (nested in cells_paragraphs).
+
+    Strategy:
+    - Build a mapping from element_id -> actual element dict object
+      for:
+        * top-level elements
+        * nested cell paragraphs inside tables
+    - For each RuleApplicationResult with updated_element and status == "success":
+      * locate target by element_id
+      * replace target's contents with updated_element (in-place)
+    """
+    elements: List[Dict[str, Any]] = state.get("elements") or []
+    results: List[RuleApplicationResult] = state.get("results") or []
+
+    if not elements or not results:
+        return state
+
+    # Keep a snapshot of original elements if not already stored
+    if "original_elements" not in state or state.get("original_elements") is None:
+        state["original_elements"] = list(elements)
+
+    # ------------------------------------------------------------------
+    # Build element_id -> element mapping, including nested cell paragraphs
+    # ------------------------------------------------------------------
+    by_id: Dict[Any, Dict[str, Any]] = {}
+
+    for el in elements:
+        eid = el.get("element_id")
+        if eid is not None:
+            by_id[eid] = el
+
+        # if this is a table, also index all cell paragraphs
+        if el.get("type") == "table":
+            cells_paras = el.get("cells_paragraphs") or []
+            for row in cells_paras:
+                for cell_paras in row:
+                    for p_meta in cell_paras:
+                        if isinstance(p_meta, dict):
+                            pid = p_meta.get("element_id")
+                            if pid is not None:
+                                by_id[pid] = p_meta
+
+    # ------------------------------------------------------------------
+    # Apply updates
+    # ------------------------------------------------------------------
+    for res in results:
+        status = res.get("status")
+        updated = res.get("updated_element")
+
+        if status != "success" or not updated or not isinstance(updated, dict):
+            continue
+
+        # Prefer element_id from updated_element; fall back to result.element_id
+        target_id = updated.get("element_id") or res.get("element_id")
+        if not target_id:
+            continue
+
+        target = by_id.get(target_id)
+        if not target:
+            # Could log a warning here if desired
+            continue
+
+        # Replace target's content in-place
+        target.clear()
+        target.update(updated)
+
+    # Top-level 'elements' list structure is unchanged; inner dicts were mutated
+    # For completeness, you can still rebuild top-level list by element_id if needed,
+    # but it's not strictly required.
+    return {
+        **state,
+        "elements": elements,
+    }

@@ -1,0 +1,195 @@
+from typing import List, Dict, Any, Tuple, Optional
+from pathlib import Path
+
+from docx import Document
+from docx.text.paragraph import Paragraph
+from docx.table import Table
+from docx.shared import RGBColor
+from docx.enum.text import WD_COLOR_INDEX
+
+from metadata_extraction_final.metadata import iter_section_blocks
+
+DEFAULT_BASE_FONT_NAME = "Times New Roman"
+DEFAULT_BASE_FONT_COLOR = RGBColor(0, 0, 0)
+DEFAULT_HIGHLIGHT_COLOR = WD_COLOR_INDEX.YELLOW
+
+
+def _xml_safe_text(s: str) -> str:
+    if not isinstance(s, str):
+        s = str(s)
+    return "".join(
+        ch
+        for ch in s
+        if ch == "\t" or ch == "\n" or ch == "\r" or ord(ch) >= 0x20
+    )
+
+
+def _split_page_break_marker(text: str) -> Tuple[bool, str]:
+    if not isinstance(text, str):
+        return False, text
+    has_break = "\f" in text
+    if has_break:
+        text = text.replace("\f", "")
+    return has_break, text
+
+
+def _apply_base_font_to_paragraph_runs(
+    paragraph: Paragraph,
+    base_font_name: str,
+    base_font_color: Optional[RGBColor],
+) -> None:
+    for run in paragraph.runs:
+        font = run.font
+        font.name = base_font_name
+        font.bold = False
+        font.italic = False
+        font.underline = False
+        if base_font_color is not None:
+            font.color.rgb = base_font_color
+
+
+def _replace_paragraph_text(
+    paragraph: Paragraph,
+    new_text: str,
+    *,
+    enforce_base_font: bool,
+    base_font_name: str,
+    base_font_color: Optional[RGBColor],
+) -> None:
+    new_text = _xml_safe_text(new_text)
+
+    if not paragraph.runs:
+        paragraph.text = new_text
+    else:
+        for run in paragraph.runs:
+            run.text = ""
+        paragraph.runs[0].text = new_text
+
+    if enforce_base_font:
+        _apply_base_font_to_paragraph_runs(
+            paragraph=paragraph,
+            base_font_name=base_font_name,
+            base_font_color=base_font_color,
+        )
+
+
+def apply_final_elements_to_docx(
+    original_docx_path: str,
+    final_elements: List[Dict[str, Any]],
+    output_docx_path: str,
+    highlight_changes: bool = True,
+    *,
+    enforce_base_font: bool = True,
+    base_font_name: str = DEFAULT_BASE_FONT_NAME,
+    base_font_color: Optional[RGBColor] = DEFAULT_BASE_FONT_COLOR,
+    highlight_color: WD_COLOR_INDEX = DEFAULT_HIGHLIGHT_COLOR,
+) -> None:
+    """
+    Open the original DOCX, apply updated paragraph text from final_elements
+    (including paragraphs inside tables), and save a new DOCX.
+
+    Uses the same block_index scheme as the extractor:
+      - each table gets one block_index for the table itself
+      - each cell paragraph gets its own subsequent block_index
+    """
+    doc = Document(original_docx_path)
+
+    # 1) Build lookup of ALL paragraph metadata by block_index
+    paragraphs_by_block_index: Dict[int, Dict[str, Any]] = {}
+
+    for el in final_elements:
+        el_type = el.get("type")
+
+        if el_type == "paragraph":
+            bi = el.get("block_index")
+            if isinstance(bi, int):
+                paragraphs_by_block_index[bi] = el
+
+        elif el_type == "table":
+            cells_paras = el.get("cells_paragraphs") or []
+            for row in cells_paras:
+                for cell_paras in row:
+                    for p_meta in cell_paras:
+                        if isinstance(p_meta, dict):
+                            bi = p_meta.get("block_index")
+                            if isinstance(bi, int):
+                                paragraphs_by_block_index[bi] = p_meta
+
+    # 2) Walk DOCX in same order / block_index scheme as extractor
+    block_index = 0
+
+    for info, block in iter_section_blocks(doc):
+        if isinstance(block, Paragraph):
+            p_meta = paragraphs_by_block_index.get(block_index)
+            if p_meta is not None:
+                updated_text = p_meta.get("raw_text")
+                if isinstance(updated_text, str):
+                    has_page_break, text_without_ff = _split_page_break_marker(
+                        updated_text
+                    )
+                    safe_new = _xml_safe_text(text_without_ff)
+                    old_text = block.text or ""
+
+                    text_changed = safe_new != old_text
+                    if text_changed:
+                        _replace_paragraph_text(
+                            block,
+                            safe_new,
+                            enforce_base_font=enforce_base_font,
+                            base_font_name=base_font_name,
+                            base_font_color=base_font_color,
+                        )
+                        if highlight_changes:
+                            for run in block.runs:
+                                try:
+                                    run.font.highlight_color = highlight_color
+                                except Exception:
+                                    continue
+
+                    if has_page_break:
+                        block.paragraph_format.page_break_before = True
+
+            block_index += 1
+
+        elif isinstance(block, Table):
+            # table itself consumes one block_index
+            block_index += 1
+
+            # then all cell paragraphs in row/col/para order
+            for row in block.rows:
+                for cell in row.cells:
+                    for p in cell.paragraphs:
+                        p_meta = paragraphs_by_block_index.get(block_index)
+                        if p_meta is not None:
+                            updated_text = p_meta.get("raw_text")
+                            if isinstance(updated_text, str):
+                                has_page_break, text_without_ff = _split_page_break_marker(
+                                    updated_text
+                                )
+                                safe_new = _xml_safe_text(text_without_ff)
+                                old_text = p.text or ""
+
+                                text_changed = safe_new != old_text
+                                if text_changed:
+                                    _replace_paragraph_text(
+                                        p,
+                                        safe_new,
+                                        enforce_base_font=enforce_base_font,
+                                        base_font_name=base_font_name,
+                                        base_font_color=base_font_color,
+                                    )
+                                    if highlight_changes:
+                                        for run in p.runs:
+                                            try:
+                                                run.font.highlight_color = highlight_color
+                                            except Exception:
+                                                continue
+
+                                if has_page_break:
+                                    p.paragraph_format.page_break_before = True
+
+                        block_index += 1
+
+    out_path = Path(output_docx_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(output_docx_path)

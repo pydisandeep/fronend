@@ -1,0 +1,153 @@
+import json
+import logging
+from typing import Any, Dict, List
+
+from schemas.vqc_state_new import VQCState, RuleApplicationResult, LabelRule
+from helper_functions.detect_blank_element import is_blank_element
+from helper_functions.llm_reasoning_chain import llm_reasoning_chain  # assuming this import
+
+logger = logging.getLogger(__name__)
+
+
+def llm_reasoning_node(state: VQCState) -> VQCState:
+    rule: LabelRule = state.get("rule")  # type: ignore[assignment]
+    elements: List[Dict[str, Any]] = state.get("elements") or []
+    results: List[RuleApplicationResult] = state.get("results") or []
+    error_log: List[str] = state.get("error_log") or []
+
+    if rule is None:
+        logger.info("llm_rule_node: no rule present; skipping.")
+        return state
+
+    # Serialize rule/config once
+    if hasattr(rule, "model_dump"):
+        rule_dict = rule.model_dump()
+    elif hasattr(rule, "dict"):
+        rule_dict = rule.dict()  # type: ignore[assignment]
+    else:
+        rule_dict = dict(rule)   # type: ignore[arg-type]
+
+    parsed_rule_str = json.dumps(rule_dict, ensure_ascii=False)
+
+    # Normalize applies_to_elements
+    allowed_types_raw = getattr(rule, "applies_to_elements", None)
+    if allowed_types_raw is None:
+        allowed_types: List[Any] = []
+    elif isinstance(allowed_types_raw, list):
+        allowed_types = allowed_types_raw
+    else:
+        allowed_types = [allowed_types_raw]
+
+    def _element_type_allowed(elem_type: Any) -> bool:
+        if not allowed_types:
+            return True
+        return elem_type in allowed_types
+
+    # ------------------------------------------------------------------
+    # Flatten elements for LLM:
+    #   - top-level elements
+    #   - table cell paragraphs (cells_paragraphs)
+    # ------------------------------------------------------------------
+    elements_for_llm: List[Dict[str, Any]] = []
+
+    for el in elements:
+        el_type = el.get("type")
+
+        # top-level element
+        if _element_type_allowed(el_type) and not is_blank_element(el):
+            elements_for_llm.append(el)
+
+        # if table, also include cell paragraphs
+        if el_type == "table":
+            cells_paras = el.get("cells_paragraphs") or []
+            for row in cells_paras:
+                for cell_paras in row:
+                    for p_meta in cell_paras:
+                        if (
+                            isinstance(p_meta, dict)
+                            and p_meta.get("type") == "paragraph"
+                            and _element_type_allowed("paragraph")
+                            and not is_blank_element(p_meta)
+                        ):
+                            elements_for_llm.append(p_meta)
+
+    # ------------------------------------------------------------------
+    # Run LLM on each selected element
+    # ------------------------------------------------------------------
+    for element in elements_for_llm:
+        element_id = element.get("element_id")
+        element_type = element.get("type")
+
+        try:
+            element_str = json.dumps(element, ensure_ascii=False)
+
+            raw_json = llm_reasoning_chain.invoke(
+                {
+                    "user_input": rule.user_input or "",
+                    "parsed_rule": parsed_rule_str,
+                    "element": element_str,
+                }
+            )
+
+            if isinstance(raw_json, dict):
+                result_obj = raw_json
+            else:
+                result_obj = json.loads(raw_json)
+
+            if not isinstance(result_obj, dict):
+                raise ValueError("LLM did not return a JSON object.")
+
+            base_result: RuleApplicationResult = {
+                "user_input": rule.user_input,
+                "instruction": rule.instruction,
+                "description": rule.description,
+                "rule": rule_dict,
+                "rule_id": rule.rule_id,
+                "element_id": element_id,
+                "element_type": element_type,
+                "passed": True,
+                "comments": "",
+                "original_element": element,
+                "updated_element": None,
+                "status": "success",
+                "error_log": [],
+                "execution_log": [],
+            }
+
+            # Overwrite with what the LLM provided
+            base_result.update(result_obj)
+
+            # Ensure element_id is set
+            if base_result.get("element_id") is None:
+                base_result["element_id"] = element_id
+
+            results.append(base_result)
+
+        except Exception as e:
+            msg = f"Error in llm_rule_node for element {element_id}: {e}"
+            logger.error(msg)
+            error_log.append(msg)
+
+            failed_result: RuleApplicationResult = {
+                "user_input": rule.user_input,
+                "instruction": rule.instruction,
+                "description": rule.description,
+                "rule": rule_dict,
+                "rule_id": rule.rule_id,
+                "element_id": element_id,
+                "element_type": element_type,
+                "passed": False,
+                "comments": f"LLM rule evaluation failed with error: {e}",
+                "original_element": element,
+                "updated_element": None,
+                "status": "failed",
+                "error_log": [msg],
+                "execution_log": [],
+            }
+            results.append(failed_result)
+
+    return {
+        **state,
+        "results": results,
+        "error_log": error_log,
+    }
